@@ -2,13 +2,39 @@ export interface Env {
   AI: any;
 }
 
-const DEFAULT_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+// Fallback active models for 2026
+const FALLBACK_FAST_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+const FALLBACK_LARGE_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8";
+
 const MAX_CONTEXT_CHARS = 24000;
 
 /**
- * Safely extracts plain text from OpenAI / Copilot content types.
- * Copilot often sends array blocks: [{ type: 'text', text: '...' }]
+ * Resolves the requested model from Copilot to an active Cloudflare Workers AI model tag.
  */
+function resolveModel(requestedModel: any): string {
+  if (typeof requestedModel !== "string" || !requestedModel.trim()) {
+    return FALLBACK_FAST_MODEL;
+  }
+
+  const model = requestedModel.trim();
+
+  // If Copilot passes a standard Workers AI tag, use it directly
+  if (model.startsWith("@cf/") || model.startsWith("@hf/")) {
+    // Prevent using deprecated llama-3.1-8b base tag
+    if (model === "@cf/meta/llama-3.1-8b-instruct") {
+      return FALLBACK_FAST_MODEL;
+    }
+    return model;
+  }
+
+  // Map generic Copilot / OpenAI model names to Cloudflare equivalents
+  if (model.includes("gpt-4") || model.includes("70b") || model.includes("claude")) {
+    return FALLBACK_LARGE_MODEL;
+  }
+
+  return FALLBACK_FAST_MODEL;
+}
+
 function normalizeContent(content: any): string {
   if (typeof content === "string") {
     return content;
@@ -29,9 +55,6 @@ function normalizeContent(content: any): string {
   return String(content || "");
 }
 
-/**
- * Maps OpenAI/Copilot roles to roles supported by Cloudflare Workers AI
- */
 function normalizeRole(role: string): "system" | "user" | "assistant" {
   switch (role) {
     case "system":
@@ -66,6 +89,9 @@ export default {
 
     try {
       const body: any = await request.json();
+
+      // Dynamically select the model passed from Copilot body
+      const selectedModel = resolveModel(body.model);
       const rawMessages = Array.isArray(body.messages) ? body.messages : [];
 
       // 1. Sanitize roles and enforce string-only content format for Workers AI
@@ -76,7 +102,7 @@ export default {
         }))
         .filter((msg) => msg.content.trim().length > 0);
 
-      // 2. Budget and truncate historical messages to stay within payload bounds
+      // 2. Truncate historical messages to stay within payload limits
       let totalLength = 0;
       let finalMessages: Array<{ role: string; content: string }> = [];
 
@@ -106,29 +132,28 @@ export default {
 
       finalMessages = systemMsg ? [systemMsg, ...keptHistory] : keptHistory;
 
-      // Ensure at least one message is sent
       if (finalMessages.length === 0) {
         finalMessages = [{ role: "user", content: "Hello" }];
       }
 
       const isStream = Boolean(body.stream);
 
-      // 3. Handle Streaming Response
+      // 3. Streaming execution
       if (isStream) {
         let aiStream: any;
         try {
-          aiStream = await env.AI.run(DEFAULT_MODEL, {
+          aiStream = await env.AI.run(selectedModel, {
             messages: finalMessages,
             stream: true,
             max_tokens: 2048,
-            temperature: 0.2,
+            temperature: body.temperature ?? 0.2,
           });
         } catch (aiErr: any) {
-          console.error("Workers AI Binding Execution Failed:", aiErr);
+          console.error(`Workers AI Execution Error with model standard (${selectedModel}):`, aiErr);
           return new Response(
             JSON.stringify({
               error: {
-                message: `Workers AI Execution Error: ${aiErr.message || aiErr}`,
+                message: `Workers AI Execution Error [${selectedModel}]: ${aiErr.message || aiErr}`,
                 type: "invalid_request_error",
                 code: 400,
               },
@@ -173,7 +198,7 @@ export default {
                         id,
                         object: "chat.completion.chunk",
                         created,
-                        model: "copilot-proxy",
+                        model: selectedModel,
                         choices: [
                           {
                             index: 0,
@@ -195,7 +220,7 @@ export default {
               id,
               object: "chat.completion.chunk",
               created,
-              model: "copilot-proxy",
+              model: selectedModel,
               choices: [
                 {
                   index: 0,
@@ -223,11 +248,12 @@ export default {
         });
       }
 
-      // 4. Handle Non-Streaming Response
-      const aiResponse: any = await env.AI.run(DEFAULT_MODEL, {
+      // 4. Non-Streaming execution
+      const aiResponse: any = await env.AI.run(selectedModel, {
         messages: finalMessages,
         stream: false,
         max_tokens: 2048,
+        temperature: body.temperature ?? 0.2,
       });
 
       const responseText = typeof aiResponse === "string" ? aiResponse : aiResponse.response || "";
@@ -237,7 +263,7 @@ export default {
           id: `chatcmpl-${crypto.randomUUID()}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
-          model: "copilot-proxy",
+          model: selectedModel,
           choices: [
             {
               index: 0,
