@@ -1,93 +1,201 @@
+export interface Env {
+  AI: Ai;
+}
+
+const DEFAULT_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+
 export default {
-  async fetch(request, env) {
-    // 1. Enforce POST request (standard OpenAI chat completions format)
-    if (request.method !== "POST") {
-      return new Response(
-        JSON.stringify({ error: "Method not allowed. Send a POST request." }),
-        { status: 405, headers: { "Content-Type": "application/json" } }
-      );
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Handle CORS Preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+        },
+      });
+    }
+
+    // Only allow POST to /v1/chat/completions or root path
+    const url = new URL(request.url);
+    if (request.method !== "POST" || (!url.pathname.endsWith("/v1/chat/completions") && url.pathname !== "/")) {
+      return new Response(JSON.stringify({ error: "Not Found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     try {
-      const body = await request.json();
+      const body: any = await request.json();
 
-      // 2. Extract requested model dynamically from VS Code Copilot's payload
-      const modelId = body.model;
-      if (!modelId) {
-        return new Response(
-          JSON.stringify({ error: "Missing 'model' field in JSON payload." }),
-          { status: 400, headers: { "Content-Type": "application/json" } }
-        );
+      // Normalize model name or fallback to a standard supported model
+      let model = body.model || DEFAULT_MODEL;
+      if (model.startsWith("gpt-") || model.startsWith("copilot-")) {
+        model = DEFAULT_MODEL;
       }
 
-      // 3. Extract and sanitize messages
-      const messages = body.messages || [];
+      // Map incoming OpenAI messages into Workers AI standard format
+      const messages = (body.messages || []).map((msg: any) => ({
+        role: msg.role,
+        content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+      }));
 
-      // 4. Extract standard parameters if provided
-      const max_tokens = body.max_tokens || body.max_completion_tokens || 2048;
-      const temperature = body.temperature ?? 0.7;
-      const stream = body.stream ?? false;
+      const isStream = Boolean(body.stream);
 
-      // 5. Execute model natively via Cloudflare Workers AI Binding (env.AI)
-      const aiResponse = await env.AI.run(modelId, {
-        messages: messages,
-        max_tokens: max_tokens,
-        temperature: temperature,
-        stream: stream
-      });
+      // Handle Streaming Requests (SSE)
+      if (isStream) {
+        const aiStream = await env.AI.run(model, {
+          messages,
+          stream: true,
+          max_tokens: body.max_tokens || body.max_completion_tokens || 2048,
+          temperature: body.temperature ?? 0.7,
+        });
 
-      // 6. Handle streaming vs non-streaming response
-      if (stream) {
-        return new Response(aiResponse, {
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
+        const id = `chatcmpl-${crypto.randomUUID()}`;
+        const created = Math.floor(Date.now() / 1000);
+
+        // Transform standard Workers AI SSE stream to strict OpenAI SSE chunks
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const reader = (aiStream as ReadableStream).getReader();
+        const decoder = new TextDecoder();
+
+        (async () => {
+          let buffer = "";
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith(":")) continue;
+
+                if (trimmed.startsWith("data: ")) {
+                  const dataStr = trimmed.slice(6);
+                  if (dataStr === "[DONE]") continue;
+
+                  try {
+                    const parsed = JSON.parse(dataStr);
+                    const chunkText = parsed.response || parsed.delta?.content || "";
+
+                    if (chunkText) {
+                      const openAiChunk = {
+                        id,
+                        object: "chat.completion.chunk",
+                        created,
+                        model: body.model || "copilot-proxy-model",
+                        choices: [
+                          {
+                            index: 0,
+                            delta: { content: chunkText },
+                            finish_reason: null,
+                          },
+                        ],
+                      };
+                      await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(openAiChunk)}\n\n`));
+                    }
+                  } catch {
+                    // Ignore non-JSON payload fragments
+                  }
+                }
+              }
+            }
+
+            // Write final stream completion signals
+            const finalChunk = {
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model: body.model || "copilot-proxy-model",
+              choices: [
+                {
+                  index: 0,
+                  delta: {},
+                  finish_reason: "stop",
+                },
+              ],
+            };
+            await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+            await writer.write(new TextEncoder().encode("data: [DONE]\n\n"));
+          } catch (err: any) {
+            console.error("Stream transformation error:", err);
+          } finally {
+            await writer.close();
           }
+        })();
+
+        return new Response(readable, {
+          headers: {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+          },
         });
       }
 
-      // 7. Format non-streaming output to OpenAI ChatCompletion structure
-      const responsePayload = {
+      // Handle Non-Streaming Requests
+      const aiResponse: any = await env.AI.run(model, {
+        messages,
+        stream: false,
+        max_tokens: body.max_tokens || 2048,
+        temperature: body.temperature ?? 0.7,
+      });
+
+      const responseText = typeof aiResponse === "string" ? aiResponse : aiResponse.response || "";
+
+      const openAiResponse = {
         id: `chatcmpl-${crypto.randomUUID()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
-        model: modelId,
+        model: body.model || "copilot-proxy-model",
         choices: [
           {
             index: 0,
             message: {
               role: "assistant",
-              content: aiResponse.response || aiResponse.text || ""
+              content: responseText,
             },
-            finish_reason: "stop"
-          }
+            finish_reason: "stop",
+          },
         ],
         usage: {
           prompt_tokens: 0,
           completion_tokens: 0,
-          total_tokens: 0
-        }
+          total_tokens: 0,
+        },
       };
 
-      return new Response(JSON.stringify(responsePayload), {
-        status: 200,
+      return new Response(JSON.stringify(openAiResponse), {
         headers: {
           "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        }
+          "Access-Control-Allow-Origin": "*",
+        },
       });
-    } catch (err) {
+    } catch (err: any) {
+      console.error("Worker Proxy Error:", err);
       return new Response(
         JSON.stringify({
           error: {
-            message: `Workers AI Execution Error: ${err.message}`,
-            type: "invalid_request_error",
-            code: 7003
-          }
+            message: err?.message || "Internal Server Error in Copilot Proxy",
+            type: "server_error",
+            code: 500,
+          },
         }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        }
       );
     }
-  }
+  },
 };
