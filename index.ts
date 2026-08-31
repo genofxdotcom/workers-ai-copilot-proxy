@@ -1,12 +1,51 @@
 export interface Env {
-  AI: Ai;
+  AI: any;
 }
 
 const DEFAULT_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+const MAX_CONTEXT_CHARS = 24000;
+
+/**
+ * Safely extracts plain text from OpenAI / Copilot content types.
+ * Copilot often sends array blocks: [{ type: 'text', text: '...' }]
+ */
+function normalizeContent(content: any): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && item.text) return item.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content && typeof content === "object") {
+    return JSON.stringify(content);
+  }
+  return String(content || "");
+}
+
+/**
+ * Maps OpenAI/Copilot roles to roles supported by Cloudflare Workers AI
+ */
+function normalizeRole(role: string): "system" | "user" | "assistant" {
+  switch (role) {
+    case "system":
+    case "developer":
+      return "system";
+    case "assistant":
+      return "assistant";
+    default:
+      return "user";
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Handle CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -17,7 +56,6 @@ export default {
       });
     }
 
-    // Only allow POST to /v1/chat/completions or root path
     const url = new URL(request.url);
     if (request.method !== "POST" || (!url.pathname.endsWith("/v1/chat/completions") && url.pathname !== "/")) {
       return new Response(JSON.stringify({ error: "Not Found" }), {
@@ -28,34 +66,80 @@ export default {
 
     try {
       const body: any = await request.json();
+      const rawMessages = Array.isArray(body.messages) ? body.messages : [];
 
-      // Normalize model name or fallback to a standard supported model
-      let model = body.model || DEFAULT_MODEL;
-      if (model.startsWith("gpt-") || model.startsWith("copilot-")) {
-        model = DEFAULT_MODEL;
+      // 1. Sanitize roles and enforce string-only content format for Workers AI
+      const cleanedMessages = rawMessages
+        .map((msg: any) => ({
+          role: normalizeRole(msg.role),
+          content: normalizeContent(msg.content),
+        }))
+        .filter((msg) => msg.content.trim().length > 0);
+
+      // 2. Budget and truncate historical messages to stay within payload bounds
+      let totalLength = 0;
+      let finalMessages: Array<{ role: string; content: string }> = [];
+
+      const systemMsg = cleanedMessages.find((m) => m.role === "system");
+      if (systemMsg) {
+        finalMessages.push(systemMsg);
+        totalLength += systemMsg.content.length;
       }
 
-      // Map incoming OpenAI messages into Workers AI standard format
-      const messages = (body.messages || []).map((msg: any) => ({
-        role: msg.role,
-        content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
-      }));
+      const history = cleanedMessages.filter((m) => m.role !== "system").reverse();
+      const keptHistory = [];
+
+      for (const msg of history) {
+        if (totalLength + msg.content.length > MAX_CONTEXT_CHARS) {
+          const remainingBudget = Math.max(1000, MAX_CONTEXT_CHARS - totalLength);
+          if (remainingBudget > 500) {
+            keptHistory.unshift({
+              role: msg.role,
+              content: msg.content.slice(-remainingBudget),
+            });
+          }
+          break;
+        }
+        keptHistory.unshift(msg);
+        totalLength += msg.content.length;
+      }
+
+      finalMessages = systemMsg ? [systemMsg, ...keptHistory] : keptHistory;
+
+      // Ensure at least one message is sent
+      if (finalMessages.length === 0) {
+        finalMessages = [{ role: "user", content: "Hello" }];
+      }
 
       const isStream = Boolean(body.stream);
 
-      // Handle Streaming Requests (SSE)
+      // 3. Handle Streaming Response
       if (isStream) {
-        const aiStream = await env.AI.run(model, {
-          messages,
-          stream: true,
-          max_tokens: body.max_tokens || body.max_completion_tokens || 2048,
-          temperature: body.temperature ?? 0.7,
-        });
+        let aiStream: any;
+        try {
+          aiStream = await env.AI.run(DEFAULT_MODEL, {
+            messages: finalMessages,
+            stream: true,
+            max_tokens: 2048,
+            temperature: 0.2,
+          });
+        } catch (aiErr: any) {
+          console.error("Workers AI Binding Execution Failed:", aiErr);
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: `Workers AI Execution Error: ${aiErr.message || aiErr}`,
+                type: "invalid_request_error",
+                code: 400,
+              },
+            }),
+            { status: 400, headers: { "Content-Type": "application/json" } }
+          );
+        }
 
         const id = `chatcmpl-${crypto.randomUUID()}`;
         const created = Math.floor(Date.now() / 1000);
 
-        // Transform standard Workers AI SSE stream to strict OpenAI SSE chunks
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
         const reader = (aiStream as ReadableStream).getReader();
@@ -89,7 +173,7 @@ export default {
                         id,
                         object: "chat.completion.chunk",
                         created,
-                        model: body.model || "copilot-proxy-model",
+                        model: "copilot-proxy",
                         choices: [
                           {
                             index: 0,
@@ -107,12 +191,11 @@ export default {
               }
             }
 
-            // Write final stream completion signals
             const finalChunk = {
               id,
               object: "chat.completion.chunk",
               created,
-              model: body.model || "copilot-proxy-model",
+              model: "copilot-proxy",
               choices: [
                 {
                   index: 0,
@@ -124,7 +207,7 @@ export default {
             await writer.write(new TextEncoder().encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
             await writer.write(new TextEncoder().encode("data: [DONE]\n\n"));
           } catch (err: any) {
-            console.error("Stream transformation error:", err);
+            console.error("Stream transformation failure:", err);
           } finally {
             await writer.close();
           }
@@ -140,61 +223,42 @@ export default {
         });
       }
 
-      // Handle Non-Streaming Requests
-      const aiResponse: any = await env.AI.run(model, {
-        messages,
+      // 4. Handle Non-Streaming Response
+      const aiResponse: any = await env.AI.run(DEFAULT_MODEL, {
+        messages: finalMessages,
         stream: false,
-        max_tokens: body.max_tokens || 2048,
-        temperature: body.temperature ?? 0.7,
+        max_tokens: 2048,
       });
 
       const responseText = typeof aiResponse === "string" ? aiResponse : aiResponse.response || "";
 
-      const openAiResponse = {
-        id: `chatcmpl-${crypto.randomUUID()}`,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: body.model || "copilot-proxy-model",
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: "assistant",
-              content: responseText,
+      return new Response(
+        JSON.stringify({
+          id: `chatcmpl-${crypto.randomUUID()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: "copilot-proxy",
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: responseText },
+              finish_reason: "stop",
             },
-            finish_reason: "stop",
-          },
-        ],
-        usage: {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0,
-        },
-      };
-
-      return new Response(JSON.stringify(openAiResponse), {
-        headers: {
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
+          ],
+        }),
+        { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+      );
     } catch (err: any) {
       console.error("Worker Proxy Error:", err);
       return new Response(
         JSON.stringify({
           error: {
-            message: err?.message || "Internal Server Error in Copilot Proxy",
-            type: "server_error",
+            message: err.message || "Internal Server Error",
+            type: "api_error",
             code: 500,
           },
         }),
-        {
-          status: 500,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-          },
-        }
+        { status: 500, headers: { "Content-Type": "application/json" } }
       );
     }
   },
