@@ -1,0 +1,6 @@
+name = "copilot-cf-proxy"
+main = "index.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+CLOUDFLARE_ACCOUNT_ID = "5b49642f856e69ac463af10e6da43323"
