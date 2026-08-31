@@ -1,6 +1,6 @@
 export default {
   async fetch(request, env) {
-    // 1. Only handle POST requests (standard for Chat Completions)
+    // 1. Enforce POST request (standard OpenAI chat completions format)
     if (request.method !== "POST") {
       return new Response(
         JSON.stringify({ error: "Method not allowed. Send a POST request." }),
@@ -11,57 +11,81 @@ export default {
     try {
       const body = await request.json();
 
-      // 2. Extract requested model dynamically from payload
+      // 2. Extract requested model dynamically from VS Code Copilot's payload
       const modelId = body.model;
       if (!modelId) {
         return new Response(
-          JSON.stringify({ error: "Missing 'model' field in JSON body." }),
+          JSON.stringify({ error: "Missing 'model' field in JSON payload." }),
           { status: 400, headers: { "Content-Type": "application/json" } }
         );
       }
 
-      // 3. Clean payload: Remove parameters that cause Error 7003 on Workers AI
-      delete body.tools;
-      delete body.tool_choice;
-      delete body.presence_penalty;
-      delete body.frequency_penalty;
-      delete body.user;
-      delete body.logit_bias;
+      // 3. Extract and sanitize messages
+      const messages = body.messages || [];
 
-      // 4. Construct target Cloudflare Workers AI REST API URL
-      const accountId = env.CLOUDFLARE_ACCOUNT_ID || "5b49642f856e69ac463af10e6da43323";
-      const targetUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
+      // 4. Extract standard parameters if provided
+      const max_tokens = body.max_tokens || body.max_completion_tokens || 2048;
+      const temperature = body.temperature ?? 0.7;
+      const stream = body.stream ?? false;
 
-      // 5. Use TOKEN from environment (fallback to Authorization header if set)
-      const token = env.TOKEN || request.headers.get("Authorization")?.replace("Bearer ", "");
-      if (!token) {
-        return new Response(
-          JSON.stringify({ error: "API Token missing. Set TOKEN environment secret in Worker." }),
-          { status: 401, headers: { "Content-Type": "application/json" } }
-        );
-      }
-
-      // 6. Forward sanitized payload to Cloudflare Workers AI
-      const cfResponse = await fetch(targetUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(body)
+      // 5. Execute model natively via Cloudflare Workers AI Binding (env.AI)
+      const aiResponse = await env.AI.run(modelId, {
+        messages: messages,
+        max_tokens: max_tokens,
+        temperature: temperature,
+        stream: stream
       });
 
-      // 7. Return exact response stream/json back to Copilot
-      return new Response(cfResponse.body, {
-        status: cfResponse.status,
+      // 6. Handle streaming vs non-streaming response
+      if (stream) {
+        return new Response(aiResponse, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+          }
+        });
+      }
+
+      // 7. Format non-streaming output to OpenAI ChatCompletion structure
+      const responsePayload = {
+        id: `chatcmpl-${crypto.randomUUID()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: modelId,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: aiResponse.response || aiResponse.text || ""
+            },
+            finish_reason: "stop"
+          }
+        ],
+        usage: {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0
+        }
+      };
+
+      return new Response(JSON.stringify(responsePayload), {
+        status: 200,
         headers: {
-          "Content-Type": cfResponse.headers.get("Content-Type") || "application/json",
+          "Content-Type": "application/json",
           "Access-Control-Allow-Origin": "*"
         }
       });
     } catch (err) {
       return new Response(
-        JSON.stringify({ error: "Proxy execution failed", details: err.message }),
+        JSON.stringify({
+          error: {
+            message: `Workers AI Execution Error: ${err.message}`,
+            type: "invalid_request_error",
+            code: 7003
+          }
+        }),
         { status: 500, headers: { "Content-Type": "application/json" } }
       );
     }
